@@ -17,6 +17,7 @@ Full options: python generate.py --help
 
 import argparse
 import sys
+import time
 from pathlib import Path
 
 import torch
@@ -44,15 +45,63 @@ def parse_args():
     return p.parse_args()
 
 
+def format_duration(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m {seconds % 60:02d}s"
+    return f"{seconds // 3600}h {(seconds % 3600) // 60:02d}m"
+
+
+class ProgressReporter:
+    def __init__(self, label: str, total: int, stream=None, time_fn=None, width: int = 28):
+        self.label = label
+        self.total = max(1, total)
+        self.stream = stream or sys.stderr
+        self.time_fn = time_fn or time.time
+        self.width = width
+        self.started_at = self.time_fn()
+        self.current = 0
+
+    def update(self, current: int):
+        self.current = max(0, min(current, self.total))
+        elapsed = max(0.0, self.time_fn() - self.started_at)
+        rate = self.current / elapsed if elapsed > 0 and self.current > 0 else 0.0
+        remaining = (self.total - self.current) / rate if rate > 0 else 0.0
+        pct = self.current / self.total
+        filled = int(self.width * pct)
+        bar = "#" * filled + "-" * (self.width - filled)
+        line = (
+            f"\r{self.label} [{bar}] {self.current}/{self.total} "
+            f"{pct * 100:5.1f}% elapsed {format_duration(elapsed)} "
+            f"ETA {format_duration(remaining)}"
+        )
+        self.stream.write(line)
+        self.stream.flush()
+
+    def finish(self):
+        self.update(self.total)
+        self.stream.write("\n")
+        self.stream.flush()
+
+    def step_callback(self, _pipeline, step: int, _timestep, _callback_kwargs):
+        self.update(step + 1)
+        return {}
+
+
 def save_video(frames, path: str, fps: int = 24):
     import imageio
     import numpy as np
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     frames_np = [(f.cpu().numpy() * 255).astype("uint8") for f in frames]
+    progress = ProgressReporter("Saving video", len(frames_np))
     with imageio.get_writer(str(path), fps=fps) as w:
-        for frame in frames_np:
+        for idx, frame in enumerate(frames_np, start=1):
             w.append_data(frame)
+            progress.update(idx)
+    progress.finish()
     print(f"Saved → {path}")
 
 
@@ -66,6 +115,7 @@ def main():
     )
 
     generator = torch.Generator(device="cuda").manual_seed(args.seed)
+    progress = ProgressReporter("Generating", args.steps)
 
     if args.image:
         from PIL import Image
@@ -80,6 +130,8 @@ def main():
             num_inference_steps=args.steps,
             guidance_scale=args.guidance_scale,
             generator=generator,
+            callback_on_step_end=progress.step_callback,
+            callback_on_step_end_tensor_inputs=[],
         )
     else:
         result = pipe(
@@ -91,7 +143,10 @@ def main():
             num_inference_steps=args.steps,
             guidance_scale=args.guidance_scale,
             generator=generator,
+            callback_on_step_end=progress.step_callback,
+            callback_on_step_end_tensor_inputs=[],
         )
+    progress.finish()
 
     frames = result.frames[0]
     save_video(frames, args.output)
