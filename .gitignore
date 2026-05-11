@@ -1,0 +1,17 @@
+.sulphur/
+__pycache__/
+*.py[cod]
+*.pyo
+
+outputs/
+*.mp4
+*.mov
+*.avi
+*.mkv
+
+.env
+.env.*
+.claude/settings.local.json
+
+.DS_Store
+Thumbs.db
