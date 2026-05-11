@@ -120,6 +120,15 @@ _TRANSFORMER_KEY_MAP = [
 ]
 
 
+def _fix_transformer_key(k: str) -> str:
+    """Apply sub-key renames within a transformer state dict key."""
+    k = k.replace(".k_norm.", ".norm_k.")
+    k = k.replace(".q_norm.", ".norm_q.")
+    k = k.replace(".scale_shift_table_a2v_ca_audio", ".audio_a2v_cross_attn_scale_shift_table")
+    k = k.replace(".scale_shift_table_a2v_ca_video", ".video_a2v_cross_attn_scale_shift_table")
+    return k
+
+
 def _remap_transformer(model_sd: dict) -> dict:
     """Map model.* checkpoint keys → diffusers LTX2VideoTransformer3DModel keys."""
     out = {}
@@ -127,11 +136,12 @@ def _remap_transformer(model_sd: dict) -> dict:
         mapped = False
         for src, dst in _TRANSFORMER_KEY_MAP:
             if ck.startswith(src):
-                out[dst + ck[len(src):]] = v
+                new_key = _fix_transformer_key(dst + ck[len(src):])
+                out[new_key] = v
                 mapped = True
                 break
             if ck == src:
-                out[dst] = v
+                out[_fix_transformer_key(dst)] = v
                 mapped = True
                 break
         if not mapped:
