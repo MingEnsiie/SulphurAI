@@ -1,7 +1,7 @@
 import io
 import unittest
 
-from generate import ProgressReporter, format_duration
+from src.progress import ProgressReporter, format_duration
 
 
 class ProgressReporterTest(unittest.TestCase):

@@ -56,7 +56,7 @@ Text-to-video:
   --output outputs/cat_beach.mp4
 ```
 
-During generation, the CLI prints a progress bar with elapsed time and estimated time remaining. It also shows progress while writing the MP4 file.
+During model loading, generation, and video saving, the CLI prints progress bars with elapsed time and estimated time remaining.
 
 Image-to-video:
 

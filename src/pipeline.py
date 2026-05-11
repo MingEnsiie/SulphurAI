@@ -19,7 +19,8 @@ import os
 from pathlib import Path
 
 import torch
-from safetensors.torch import load_file
+
+from .progress import ProgressReporter
 
 _DEFAULT_MODELS_DIR = Path(__file__).resolve().parents[2] / "Assets" / "models"
 _MODELS_DIR = Path(os.environ.get("SULPHUR_MODELS_DIR", _DEFAULT_MODELS_DIR)).expanduser()
@@ -319,6 +320,28 @@ def _resolve_text_encoder(override) -> str | Path:
     return _REMOTE_TEXT_ENCODER
 
 
+def _open_prefix(
+    checkpoint: Path,
+    *prefixes: str,
+    progress_label: str | None = None,
+    progress_stream=None,
+    time_fn=None,
+) -> dict:
+    """Load only keys matching any of `prefixes` from the checkpoint, without reading all 43GB."""
+    from safetensors import safe_open
+    with safe_open(str(checkpoint), framework="pt", device="cpu") as f:
+        keys = [k for k in f.keys() if any(k.startswith(p) for p in prefixes)]
+        progress = ProgressReporter(progress_label, len(keys), stream=progress_stream, time_fn=time_fn) if progress_label else None
+        tensors = {}
+        for idx, key in enumerate(keys, start=1):
+            tensors[key] = f.get_tensor(key)
+            if progress:
+                progress.update(idx)
+        if progress:
+            progress.finish()
+        return tensors
+
+
 # ---------------------------------------------------------------------------
 # Main loader
 # ---------------------------------------------------------------------------
@@ -338,6 +361,7 @@ def load_pipeline(
         torch_dtype: weight dtype (bfloat16 recommended).
         device: target device.
     """
+    import gc
     from diffusers import (
         LTX2Pipeline,
         LTX2VideoTransformer3DModel,
@@ -356,10 +380,73 @@ def load_pipeline(
     text_encoder_src = _resolve_text_encoder(text_encoder_path)
     print(f"[Sulphur] Text encoder: {text_encoder_src}")
 
-    print("[Sulphur] Loading checkpoint weights …")
-    full_sd = load_file(str(checkpoint), device="cpu")
+    # Load each component's weights independently to avoid holding all 43GB in RAM.
 
-    # ── Transformer (LTX-2.3 config) ────────────────────────────────────────
+    # ── Video VAE (Sulphur 2 config, inferred from checkpoint shapes) ────────
+    print("[Sulphur] Building video VAE …")
+    vae = AutoencoderKLLTX2Video.from_config(dict(_VAE_CFG)).to(dtype=torch_dtype)
+    raw = _open_prefix(checkpoint, "vae.", progress_label="Loading VAE weights")
+    vae_sd = _remap_vae(raw); del raw; gc.collect()
+    missing_v, unexpected_v = vae.load_state_dict(vae_sd, strict=False); del vae_sd; gc.collect()
+    print(f"  vae: {len(missing_v)} missing, {len(unexpected_v)} unexpected")
+    vae = vae.to(device); gc.collect()
+
+    # ── Audio VAE ────────────────────────────────────────────────────────────
+    print("[Sulphur] Building audio VAE …")
+    audio_vae = AutoencoderKLLTX2Audio.from_config(_AUDIO_VAE_CFG).to(dtype=torch_dtype)
+    raw = _open_prefix(checkpoint, "audio_vae.", progress_label="Loading audio VAE weights")
+    audio_vae_sd = _remap_audio_vae(raw); del raw; gc.collect()
+    missing_av, unexpected_av = audio_vae.load_state_dict(audio_vae_sd, strict=False); del audio_vae_sd; gc.collect()
+    print(f"  audio_vae: {len(missing_av)} missing, {len(unexpected_av)} unexpected")
+    audio_vae = audio_vae.to(device); gc.collect()
+
+    # ── Text connectors (LTX-2.3 / Sulphur 2 config) ────────────────────────
+    print("[Sulphur] Building text connectors …")
+    connectors = LTX2TextConnectors(
+        caption_channels=5376,
+        text_proj_in_factor=35,          # 35 × 5376 = 188 160 (Gemma 12B)
+        video_connector_num_attention_heads=32,
+        video_connector_attention_head_dim=128,
+        video_connector_num_layers=8,
+        video_connector_num_learnable_registers=128,
+        video_gated_attn=True,
+        audio_connector_num_attention_heads=32,
+        audio_connector_attention_head_dim=64,
+        audio_connector_num_layers=8,
+        audio_connector_num_learnable_registers=128,
+        audio_gated_attn=True,
+        connector_rope_base_seq_len=4096,
+        rope_theta=10000.0,
+        rope_double_precision=True,
+        causal_temporal_positioning=False,
+        rope_type="split",
+        per_modality_projections=True,
+        video_hidden_dim=4096,
+        audio_hidden_dim=2048,
+        proj_bias=True,
+    ).to(dtype=torch_dtype)
+    raw = _open_prefix(
+        checkpoint,
+        "model.diffusion_model.video_embeddings_connector.",
+        "model.diffusion_model.audio_embeddings_connector.",
+        "text_embedding_projection.",
+        progress_label="Loading connector weights",
+    )
+    conn_sd = _remap_connectors(raw); del raw; gc.collect()
+    missing_c, unexpected_c = connectors.load_state_dict(conn_sd, strict=False); del conn_sd; gc.collect()
+    print(f"  connectors: {len(missing_c)} missing, {len(unexpected_c)} unexpected")
+    connectors = connectors.to(device); gc.collect()
+
+    # ── Vocoder ──────────────────────────────────────────────────────────────
+    print("[Sulphur] Building vocoder …")
+    vocoder = LTX2VocoderWithBWE().to(dtype=torch_dtype)
+    raw = _open_prefix(checkpoint, "vocoder.", progress_label="Loading vocoder weights")
+    voc_sd = _remap_vocoder(raw); del raw; gc.collect()
+    missing_voc, unexpected_voc = vocoder.load_state_dict(voc_sd, strict=False); del voc_sd; gc.collect()
+    print(f"  vocoder: {len(missing_voc)} missing, {len(unexpected_voc)} unexpected")
+    vocoder = vocoder.to(device); gc.collect()
+
+    # ── Transformer (LTX-2.3 config) ─────────────────────────────────────────
     print("[Sulphur] Building transformer …")
     transformer = LTX2VideoTransformer3DModel(
         in_channels=128,
@@ -405,74 +492,22 @@ def load_pipeline(
         use_prompt_embeddings=False,
         perturbed_attn=False,
     ).to(dtype=torch_dtype)
-
-    model_sd = _extract(full_sd, "model.")
-    transformer_sd = _remap_transformer(model_sd)
-    missing, unexpected = transformer.load_state_dict(transformer_sd, strict=False)
-    print(f"  transformer: {len(transformer_sd)} mapped, "
-          f"{len(missing)} missing, {len(unexpected)} unexpected")
-
-    # ── Video VAE (Sulphur 2 config, inferred from checkpoint shapes) ────────
-    print("[Sulphur] Building video VAE …")
-    vae_cfg = dict(_VAE_CFG)
-    vae = AutoencoderKLLTX2Video.from_config(vae_cfg).to(dtype=torch_dtype)
-    vae_sd = _remap_vae(full_sd)
-    missing_v, unexpected_v = vae.load_state_dict(vae_sd, strict=False)
-    print(f"  vae: {len(vae_sd)} mapped, {len(missing_v)} missing, {len(unexpected_v)} unexpected")
-
-    # ── Audio VAE ────────────────────────────────────────────────────────────
-    print("[Sulphur] Building audio VAE …")
-    audio_vae = AutoencoderKLLTX2Audio.from_config(_AUDIO_VAE_CFG).to(dtype=torch_dtype)
-    audio_vae_sd = _remap_audio_vae(full_sd)
-    missing_av, unexpected_av = audio_vae.load_state_dict(audio_vae_sd, strict=False)
-    print(f"  audio_vae: {len(audio_vae_sd)} mapped, {len(missing_av)} missing, {len(unexpected_av)} unexpected")
-
-    # ── Text connectors (LTX-2.3 / Sulphur 2 config) ────────────────────────
-    print("[Sulphur] Building text connectors …")
-    connectors = LTX2TextConnectors(
-        caption_channels=5376,
-        text_proj_in_factor=35,          # 35 × 5376 = 188 160 (Gemma 12B)
-        video_connector_num_attention_heads=32,
-        video_connector_attention_head_dim=128,
-        video_connector_num_layers=8,
-        video_connector_num_learnable_registers=128,
-        video_gated_attn=True,
-        audio_connector_num_attention_heads=32,
-        audio_connector_attention_head_dim=64,
-        audio_connector_num_layers=8,
-        audio_connector_num_learnable_registers=128,
-        audio_gated_attn=True,
-        connector_rope_base_seq_len=4096,
-        rope_theta=10000.0,
-        rope_double_precision=True,
-        causal_temporal_positioning=False,
-        rope_type="split",
-        per_modality_projections=True,
-        video_hidden_dim=4096,
-        audio_hidden_dim=2048,
-        proj_bias=True,
-    ).to(dtype=torch_dtype)
-
-    conn_sd = _remap_connectors(full_sd)
-    missing_c, unexpected_c = connectors.load_state_dict(conn_sd, strict=False)
-    print(f"  connectors: {len(conn_sd)} mapped, "
-          f"{len(missing_c)} missing, {len(unexpected_c)} unexpected")
-
-    # ── Vocoder ──────────────────────────────────────────────────────────────
-    print("[Sulphur] Building vocoder …")
-    vocoder = LTX2VocoderWithBWE().to(dtype=torch_dtype)
-    voc_sd = _remap_vocoder(full_sd)
-    missing_voc, unexpected_voc = vocoder.load_state_dict(voc_sd, strict=False)
-    print(f"  vocoder: {len(voc_sd)} mapped, {len(missing_voc)} missing, {len(unexpected_voc)} unexpected")
-
-    del full_sd
+    raw = _open_prefix(checkpoint, "model.", progress_label="Loading transformer weights")
+    transformer_sd = _remap_transformer(_extract(raw, "model.")); del raw; gc.collect()
+    missing, unexpected = transformer.load_state_dict(transformer_sd, strict=False); del transformer_sd; gc.collect()
+    print(f"  transformer: {len(missing)} missing, {len(unexpected)} unexpected")
+    # Move transformer to device now so the CPU copy is freed before loading text encoder.
+    transformer = transformer.to(device); gc.collect()
     torch.cuda.empty_cache()
 
     # ── Text encoder: Gemma 3 12B (pre-quantized BNB-4bit) ──────────────────
     print(f"[Sulphur] Loading text encoder …")
+    # device_map={"": 0} forces all layers onto cuda:0 (unified-memory system),
+    # bypassing infer_auto_device_map which would wrongly try CPU offload after
+    # the transformer has consumed its share of CUDA-reported memory.
     text_encoder = AutoModelForCausalLM.from_pretrained(
         str(text_encoder_src),
-        device_map="auto",
+        device_map={"": 0},
     )
     tokenizer = AutoTokenizer.from_pretrained(str(text_encoder_src))
 
@@ -480,6 +515,9 @@ def load_pipeline(
     scheduler = LTXEulerAncestralRFScheduler()
 
     # ── Assemble pipeline ────────────────────────────────────────────────────
+    # All diffusion components are already on `device`; text_encoder is placed
+    # by device_map="auto".  Do NOT call pipe.to() — that would try to convert
+    # the BNB 4-bit text encoder to bfloat16, which is unsupported and OOMs.
     print("[Sulphur] Assembling pipeline …")
     pipe = LTX2Pipeline(
         transformer=transformer,
@@ -491,6 +529,5 @@ def load_pipeline(
         connectors=connectors,
         vocoder=vocoder,
     )
-    pipe.to(device, dtype=torch_dtype)
     print("[Sulphur] Ready.")
     return pipe
