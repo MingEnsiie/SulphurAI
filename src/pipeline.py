@@ -15,15 +15,22 @@ Architecture: LTX-2.3 (Sulphur 2)
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import torch
 from safetensors.torch import load_file
 
-_MODEL_PATH = Path("/home/mingzhang/Downloads/code/Assets/models/SulphurAI-Sulphur-2-base")
-_CHECKPOINT  = _MODEL_PATH / "sulphur_dev_bf16.safetensors"
+_DEFAULT_MODELS_DIR = Path(__file__).resolve().parents[2] / "Assets" / "models"
+_MODELS_DIR = Path(os.environ.get("SULPHUR_MODELS_DIR", _DEFAULT_MODELS_DIR)).expanduser()
+_MODEL_PATH = _MODELS_DIR / "SulphurAI-Sulphur-2-base"
+_CHECKPOINT = Path(
+    os.environ.get("SULPHUR_CHECKPOINT", _MODEL_PATH / "sulphur_dev_bf16.safetensors")
+).expanduser()
 
-_LOCAL_TEXT_ENCODER = Path("/home/mingzhang/Downloads/code/Assets/models/gemma-3-12b-it-bnb-4bit")
+_LOCAL_TEXT_ENCODER = Path(
+    os.environ.get("SULPHUR_TEXT_ENCODER", _MODELS_DIR / "gemma-3-12b-it-bnb-4bit")
+).expanduser()
 _REMOTE_TEXT_ENCODER = "unsloth/gemma-3-12b-it-bnb-4bit"
 
 # ---------------------------------------------------------------------------
@@ -263,6 +270,47 @@ def _remap_vae(full_sd: dict) -> dict:
     return out
 
 
+def _remap_audio_vae(full_sd: dict) -> dict:
+    """Map checkpoint audio_vae.* keys → diffusers AutoencoderKLLTX2Audio keys."""
+    out = {}
+    for ck, v in full_sd.items():
+        if not ck.startswith("audio_vae."):
+            continue
+        k = ck[len("audio_vae."):]
+        if k == "per_channel_statistics.mean-of-means":
+            out["latents_mean"] = v
+        elif k == "per_channel_statistics.std-of-means":
+            out["latents_std"] = v
+        else:
+            out[k] = v
+    return out
+
+
+def _remap_vocoder(full_sd: dict) -> dict:
+    """
+    Map checkpoint vocoder.* keys → diffusers LTX2VocoderWithBWE keys.
+
+    Naming differences (applied to both vocoder.* and bwe_generator.* subtrees):
+      conv_pre → conv_in, conv_post → conv_out
+      resblocks → resnets, ups → upsamplers
+      act_post → act_out
+      .downsample.lowpass.filter → .downsample.filter
+    """
+    out = {}
+    for ck, v in full_sd.items():
+        if not ck.startswith("vocoder."):
+            continue
+        k = ck[len("vocoder."):]
+        k = k.replace("conv_pre.", "conv_in.")
+        k = k.replace("conv_post.", "conv_out.")
+        k = k.replace("resblocks.", "resnets.")
+        k = k.replace(".ups.", ".upsamplers.")
+        k = k.replace("act_post.", "act_out.")
+        k = k.replace(".downsample.lowpass.filter", ".downsample.filter")
+        out[k] = v
+    return out
+
+
 def _resolve_text_encoder(override) -> str | Path:
     if override:
         return override
@@ -375,7 +423,7 @@ def load_pipeline(
     # ── Audio VAE ────────────────────────────────────────────────────────────
     print("[Sulphur] Building audio VAE …")
     audio_vae = AutoencoderKLLTX2Audio.from_config(_AUDIO_VAE_CFG).to(dtype=torch_dtype)
-    audio_vae_sd = _extract(full_sd, "audio_vae.")
+    audio_vae_sd = _remap_audio_vae(full_sd)
     missing_av, unexpected_av = audio_vae.load_state_dict(audio_vae_sd, strict=False)
     print(f"  audio_vae: {len(audio_vae_sd)} mapped, {len(missing_av)} missing, {len(unexpected_av)} unexpected")
 
@@ -413,8 +461,9 @@ def load_pipeline(
     # ── Vocoder ──────────────────────────────────────────────────────────────
     print("[Sulphur] Building vocoder …")
     vocoder = LTX2VocoderWithBWE().to(dtype=torch_dtype)
-    voc_sd = _extract(full_sd, "vocoder.")
-    vocoder.load_state_dict(voc_sd, strict=False)
+    voc_sd = _remap_vocoder(full_sd)
+    missing_voc, unexpected_voc = vocoder.load_state_dict(voc_sd, strict=False)
+    print(f"  vocoder: {len(voc_sd)} mapped, {len(missing_voc)} missing, {len(unexpected_voc)} unexpected")
 
     del full_sd
     torch.cuda.empty_cache()

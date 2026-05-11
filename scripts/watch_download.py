@@ -2,8 +2,10 @@
 import os, time, sys
 from pathlib import Path
 
-TEMP_DIR = Path("/home/mingzhang/Downloads/code/Assets/models/gemma-3-12b-it-bnb-4bit/._____temp")
-FINAL_DIR = Path("/home/mingzhang/Downloads/code/Assets/models/gemma-3-12b-it-bnb-4bit")
+DEFAULT_MODELS_DIR = Path(__file__).resolve().parents[2] / "Assets" / "models"
+MODELS_DIR = Path(os.environ.get("SULPHUR_MODELS_DIR", DEFAULT_MODELS_DIR)).expanduser()
+FINAL_DIR = Path(os.environ.get("SULPHUR_TEXT_ENCODER", MODELS_DIR / "gemma-3-12b-it-bnb-4bit")).expanduser()
+TEMP_DIR = FINAL_DIR / "._____temp"
 TOTAL_BYTES = 7_800 * 1024 * 1024  # ~7.8 GB
 
 

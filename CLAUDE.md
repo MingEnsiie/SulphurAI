@@ -2,11 +2,13 @@
 
 ## Model Paths
 
-All models are stored locally at:
+By default, model assets are expected next to the repository at:
 
 ```
-/home/mingzhang/Downloads/code/Assets/models/
+../Assets/models/
 ```
+
+The path can be overridden with `SULPHUR_MODELS_DIR`, `SULPHUR_CHECKPOINT`, or `SULPHUR_TEXT_ENCODER`.
 
 Key models:
 - `SulphurAI-Sulphur-2-base/sulphur_dev_bf16.safetensors` — main 43GB checkpoint (BF16)
@@ -26,7 +28,7 @@ Key configs differ from the public LTX-2 model:
 ## Running
 
 ```bash
-cd /home/mingzhang/Downloads/code/SulphurAI
+cd /path/to/SulphurAI
 source .sulphur/bin/activate  # activate virtualenv
 
 python generate.py \

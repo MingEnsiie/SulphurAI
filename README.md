@@ -17,12 +17,19 @@ SulphurAI is a local inference wrapper for Sulphur 2 / LTX-2.3 text-to-video and
 - CUDA-compatible PyTorch.
 - Local Sulphur model assets.
 
-The current loader expects these local paths:
+By default, the loader looks for model assets next to this repository:
 
 ```text
-/home/mingzhang/Downloads/code/Assets/models/SulphurAI-Sulphur-2-base/sulphur_dev_bf16.safetensors
-/home/mingzhang/Downloads/code/Assets/models/gemma-3-12b-it-bnb-4bit
-/home/mingzhang/.cache/huggingface/hub/models--Lightricks--LTX-2/snapshots/47da56e2ad66ce4125a9922b4a8826bf407f9d0a
+../Assets/models/SulphurAI-Sulphur-2-base/sulphur_dev_bf16.safetensors
+../Assets/models/gemma-3-12b-it-bnb-4bit
+```
+
+You can override the defaults with environment variables:
+
+```bash
+export SULPHUR_MODELS_DIR=/path/to/Assets/models
+export SULPHUR_CHECKPOINT=/path/to/sulphur_dev_bf16.safetensors
+export SULPHUR_TEXT_ENCODER=/path/to/gemma-3-12b-it-bnb-4bit
 ```
 
 If the local Gemma text encoder is missing, the script falls back to `unsloth/gemma-3-12b-it-bnb-4bit`.
